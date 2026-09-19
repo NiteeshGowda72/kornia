@@ -128,3 +128,22 @@ class RandomClahe(IntensityAugmentationBase2D):
         transform: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return _equalize_clahe(input, params["clip_limit_factor"], flags["grid_size"], flags["slow_and_differentiable"])
+
+    def apply_transform_subset(
+        self,
+        input: torch.Tensor,
+        params: dict[str, torch.Tensor],
+        flags: dict[str, Any],
+        indices: torch.Tensor,
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        param_indices = indices.to(params["clip_limit_factor"].device)
+        selected_params = {
+            "clip_limit_factor": params["clip_limit_factor"].index_select(0, param_indices),
+        }
+        return self.apply_transform(
+            input.index_select(0, indices),
+            selected_params,
+            flags,
+            transform=transform,
+        )

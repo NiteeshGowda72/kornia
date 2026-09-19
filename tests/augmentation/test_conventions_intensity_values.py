@@ -608,42 +608,33 @@ class TestIntensityValueRangeConventions(BaseTester):
     # executed 2026-09-15 (torch 2.14.0, cpu float16/bfloat16/float32/float64 and mps float32) -> both
     # classes raise (`equalize expects input values in [0, 1]`, `index ... is out of bounds`), then
     # `True [nan, 1.0, 1.0, nan, 1.0, 1.0]`.
-    def test_wart_p_gate_computes_the_skipped_samples_4576(self, device, dtype):
+    def test_wart_p_gate_skips_samples_before_transform_4576(self, device, dtype):
         if device.type == "cuda":
             pytest.skip("not on CUDA: the value asserts are device-side asserts that poison the context")
+
         ramp = torch.linspace(0, 1, 1024).reshape(1, 1, 32, 32)
         image = torch.cat([ramp, ramp * 2.0]).to(device=device, dtype=dtype)
+
+        # The second sample is invalid for equalize/CLAHE, but p=0 means that sample must never
+        # reach the transform.
         for cls in (K.RandomEqualize, K.RandomClahe):
             torch.manual_seed(_FORWARD_SEED)
-            # It has to be the value check that fires, not merely some RuntimeError: the claim is that
-            # the transform ran on a sample `p=0.0` was supposed to skip.
-            gate_rejection = r"\[0, 1\]|out of bounds" if device.type == "cpu" else "out of bounds"
-            if device.type == "mps" and not torch_version_ge(2, 14):
-                # The transform still runs on the skipped samples, but 2.5.1 leaves the MPS gather
-                # unchecked, so the out-of-range rows come back silently instead of raising.
-                assert bool(torch.isfinite(cls(p=0.0)(image)).all())
-                continue
-            with pytest.raises(RuntimeError, match=gate_rejection):
-                _sync(cls(p=0.0)(image).device)
+            out = cls(p=0.0)(image)
+            self.assert_close(out, image)
+
+        # A skipped sample must stay on the identity autograd path. Evaluating gamma on the
+        # zero-valued element would produce an infinite derivative; that must not leak into
+        # the output gradient when the sample is rejected by the p-gate.
         values = torch.tensor([0.0, 0.25, 1.0]).reshape(1, 1, 1, 3).repeat(2, 1, 1, 1)
         values = values.to(device=device, dtype=dtype).requires_grad_()
+
         torch.manual_seed(_FORWARD_SEED)
         out = K.RandomGamma((0.5, 0.5), (1.0, 1.0), p=0.0)(values)
+
         assert torch.equal(out, values)
         out.sum().backward()
-        assert bool(values.grad[..., 0].isnan().all())
-        self.assert_close(values.grad[..., 1:], torch.ones_like(values.grad[..., 1:]))
+        self.assert_close(values.grad, torch.ones_like(values))
 
-
-class TestIntensityColourConventions(BaseTester):
-    # Row 6c-05: RandomGamma is `clamp(gain * x ** gamma, 0, 1)`; the clamp is not optional, so the
-    # class has no `clip_output` escape hatch the way RandomBrightness and RandomContrast do.
-    # Snippet used to generate expected:
-    #   g = torch.linspace(0, 1, 48).reshape(1, 1, 6, 8)
-    #   torch.manual_seed(0); y = K.RandomGamma((gamma, gamma), (gain, gain), p=1.0)(g)
-    #   print((y - (gain * g ** gamma).clamp(0, 1)).abs().max(), (y - gain * g ** gamma).abs().max())
-    # executed 2026-09-15 (torch 2.14.0, cpu) -> `0 / 1` at gamma=1.0 gain=2.0 and
-    # `5.96046e-08 / 0.5` at gamma=0.5 gain=1.5.
     @pytest.mark.parametrize(("gamma", "gain", "unclamped_gap"), [(1.0, 2.0, 1.0), (0.5, 1.5, 0.5)])
     def test_convention_random_gamma_is_clamped_gain_times_power(self, device, dtype, gamma, gain, unclamped_gap):
         ramp = torch.linspace(0, 1, 48).reshape(1, 1, 6, 8).to(device=device, dtype=dtype)
@@ -2240,3 +2231,72 @@ class TestIntensityColourConventions(BaseTester):
             clamped = generator((20000, 3, height, width))
             realised = float((clamped["heights"] > clamped["widths"]).float().mean())
             assert realised == expected, (height, width, realised)
+
+    def test_wart_p_gate_mixed_batch_skips_invalid_rows_4576(self, device, dtype):
+        if device.type == "cuda":
+            pytest.skip("not on CUDA: the value asserts are device-side asserts that poison the context")
+
+        ramp = torch.linspace(0, 1, 1024).reshape(1, 1, 32, 32)
+        image = torch.cat([ramp, ramp * 2.0]).to(device=device, dtype=dtype)
+
+        for cls in (K.RandomEqualize, K.RandomClahe):
+            aug = cls(p=0.5)
+            params = aug.forward_parameters(image.shape)
+            params["batch_prob"] = torch.tensor(
+                [True, False],
+                device=params["batch_prob"].device,
+            )
+
+            out = aug(image, params=params)
+
+            if cls is K.RandomClahe:
+                expected_params = {
+                    "clip_limit_factor": params["clip_limit_factor"][:1],
+                }
+            else:
+                expected_params = params
+
+            expected_transformed = aug.apply_transform(
+                image[:1],
+                expected_params,
+                aug.flags,
+            )
+
+            self.assert_close(out[0], expected_transformed[0])
+            self.assert_close(out[1], image[1])
+
+        values = torch.tensor(
+            [0.25, 0.5, 1.0],
+            dtype=dtype,
+            device=device,
+        ).reshape(1, 1, 1, 3)
+
+        skipped = torch.zeros_like(values)
+        values = torch.cat([values, skipped]).requires_grad_()
+
+        aug = K.RandomGamma((0.5, 0.5), (1.0, 1.0), p=0.5)
+        params = aug.forward_parameters(values.shape)
+        params["batch_prob"] = torch.tensor(
+            [True, False],
+            device=params["batch_prob"].device,
+        )
+
+        out = aug(values, params=params)
+
+        expected_transformed = aug.apply_transform(
+            values[:1],
+            {
+                "gamma_factor": params["gamma_factor"][:1],
+                "gain_factor": params["gain_factor"][:1],
+            },
+            aug.flags,
+        )
+
+        self.assert_close(out[0], expected_transformed[0])
+        self.assert_close(out[1], values[1])
+
+        out.sum().backward()
+
+        assert values.grad is not None
+        assert torch.isfinite(values.grad).all()
+        self.assert_close(values.grad[1], torch.ones_like(values.grad[1]))

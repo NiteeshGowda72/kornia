@@ -87,3 +87,13 @@ class RandomEqualize(IntensityAugmentationBase2D):
         self, input: Tensor, params: Dict[str, Tensor], flags: Dict[str, Any], transform: Optional[Tensor] = None
     ) -> Tensor:
         return equalize(input)
+
+    def apply_transform_subset(
+        self,
+        input: Tensor,
+        params: Dict[str, Tensor],
+        flags: Dict[str, Any],
+        indices: Tensor,
+        transform: Optional[Tensor] = None,
+    ) -> Tensor:
+        return equalize(input.index_select(0, indices))

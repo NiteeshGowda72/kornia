@@ -112,3 +112,23 @@ class RandomGamma(IntensityAugmentationBase2D):
         gamma_factor = params["gamma_factor"].to(input)
         gain_factor = params["gain_factor"].to(input)
         return adjust_gamma(input, gamma_factor, gain_factor)
+
+    def apply_transform_subset(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        indices: torch.Tensor,
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        param_indices = indices.to(params["gamma_factor"].device)
+        selected_params = {
+            "gamma_factor": params["gamma_factor"].index_select(0, param_indices),
+            "gain_factor": params["gain_factor"].index_select(0, param_indices),
+        }
+        return self.apply_transform(
+            input.index_select(0, indices),
+            selected_params,
+            flags,
+            transform=transform,
+        )

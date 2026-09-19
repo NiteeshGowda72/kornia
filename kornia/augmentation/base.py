@@ -364,6 +364,22 @@ class _AugmentationBase(_BasicAugmentationBase):
         # apply transform for the input image torch.Tensor
         raise NotImplementedError
 
+    def apply_transform_subset(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        indices: torch.Tensor,
+        transform: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Apply the transform to a selected subset of the batch.
+
+        Subclasses may override this when their transform parameters are
+        independent per sample. Returning ``None`` keeps the default
+        full-batch execution path.
+        """
+        return None
+
     def apply_non_transform(
         self,
         input: torch.Tensor,
@@ -408,8 +424,6 @@ class _AugmentationBase(_BasicAugmentationBase):
 
         self.validate_tensor(in_tensor)
 
-        output_transformed = self.apply_transform(in_tensor, params, flags, transform=transform)
-
         if self.p == 1.0 and self.p_batch == 1.0:
             # Always applied (static probabilities): the output is unconditionally the
             # transformed one. Skip the non-transform branch and the blend entirely — this
@@ -417,11 +431,26 @@ class _AugmentationBase(_BasicAugmentationBase):
             # since the data-dependent shape comparison / `to_apply.any()` fallback is avoided.
             # (The `to_apply` gate is only needed on the p < 1 path below, so it is not computed
             # here.)
-            output = output_transformed
+            output = self.apply_transform(in_tensor, params, flags, transform=transform)
         else:
-            to_apply = torch.atleast_1d(params["batch_prob"] > 0.5)
-            output_not_transformed = self.apply_non_transform(in_tensor, params, flags, transform=transform)
-            output = self._blend_by_prob(output_transformed, output_not_transformed, to_apply)
+            to_apply = torch.atleast_1d(params["batch_prob"] > 0.5).to(in_tensor.device)
+
+            if bool(to_apply.all()):
+                output = self.apply_transform(in_tensor, params, flags, transform=transform)
+            elif not bool(to_apply.any()):
+                output = self.apply_non_transform(in_tensor, params, flags, transform=transform)
+            else:
+                indices = torch.where(to_apply)[0]
+                output_transformed = self.apply_transform_subset(in_tensor, params, flags, indices, transform=transform)
+
+                if output_transformed is None:
+                    output_transformed = self.apply_transform(in_tensor, params, flags, transform=transform)
+                    output_not_transformed = self.apply_non_transform(in_tensor, params, flags, transform=transform)
+                    output = self._blend_by_prob(output_transformed, output_not_transformed, to_apply)
+                else:
+                    output_not_transformed = self.apply_non_transform(in_tensor, params, flags, transform=transform)
+                    output = output_not_transformed.clone()
+                    output.index_copy_(0, indices, output_transformed)
 
         if is_autocast_enabled():
             output = output.type(input.dtype)
