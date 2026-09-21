@@ -102,6 +102,9 @@ class RandomGamma(IntensityAugmentationBase2D):
             (gamma, "gamma_factor", None, None), (gain, "gain_factor", None, None)
         )
 
+    def _safe_input_for_skipped_rows(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.ones_like(input)
+
     def apply_transform(
         self,
         input: torch.Tensor,

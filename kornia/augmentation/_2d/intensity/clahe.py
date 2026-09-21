@@ -118,6 +118,9 @@ class RandomClahe(IntensityAugmentationBase2D):
         self._param_generator = rg.PlainUniformGenerator((self.clip_limit, "clip_limit_factor", None, None))
         self.flags = {"grid_size": grid_size, "slow_and_differentiable": slow_and_differentiable}
 
+    def _safe_input_for_skipped_rows(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(input)
+
     def apply_transform(
         self,
         input: torch.Tensor,

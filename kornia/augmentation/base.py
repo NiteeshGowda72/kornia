@@ -375,6 +375,10 @@ class _AugmentationBase(_BasicAugmentationBase):
         # where batch_prob == False.
         return input
 
+    def _safe_input_for_skipped_rows(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return a safe input for rows which will not be selected in the output."""
+        return None
+
     @staticmethod
     def _blend_by_prob(
         transformed: torch.Tensor, not_transformed: torch.Tensor, to_apply: torch.Tensor
@@ -408,19 +412,24 @@ class _AugmentationBase(_BasicAugmentationBase):
 
         self.validate_tensor(in_tensor)
 
-        output_transformed = self.apply_transform(in_tensor, params, flags, transform=transform)
-
         if self.p == 1.0 and self.p_batch == 1.0:
             # Always applied (static probabilities): the output is unconditionally the
             # transformed one. Skip the non-transform branch and the blend entirely — this
             # also makes shape-changing augmentations (e.g. Resize) fullgraph-compilable,
             # since the data-dependent shape comparison / `to_apply.any()` fallback is avoided.
-            # (The `to_apply` gate is only needed on the p < 1 path below, so it is not computed
-            # here.)
-            output = output_transformed
+            output = self.apply_transform(in_tensor, params, flags, transform=transform)
         else:
             to_apply = torch.atleast_1d(params["batch_prob"] > 0.5)
             output_not_transformed = self.apply_non_transform(in_tensor, params, flags, transform=transform)
+
+            safe_input = self._safe_input_for_skipped_rows(in_tensor)
+            if safe_input is not None:
+                to_apply_expanded = to_apply.view(-1, *([1] * (in_tensor.ndim - 1))).to(in_tensor.device)
+                transform_input = torch.where(to_apply_expanded, in_tensor, safe_input)
+            else:
+                transform_input = in_tensor
+
+            output_transformed = self.apply_transform(transform_input, params, flags, transform=transform)
             output = self._blend_by_prob(output_transformed, output_not_transformed, to_apply)
 
         if is_autocast_enabled():
